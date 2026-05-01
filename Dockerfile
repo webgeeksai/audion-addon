@@ -1,12 +1,15 @@
-FROM node:22-alpine
+FROM node:22-bookworm-slim
 
 WORKDIR /app
 
-# better-sqlite3 needs build tools at install time
-RUN apk add --no-cache python3 make g++
+# Debian glibc base: better-sqlite3 ships prebuilt binaries for this ABI,
+# so no source compile needed. Tiny image still — slim is ~80MB.
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY package.json package-lock.json* ./
-RUN npm install --production --legacy-peer-deps
+RUN npm ci --omit=dev --no-audit --no-fund \
+    || npm install --production --legacy-peer-deps --no-audit --no-fund
 
 COPY src ./src
 
@@ -17,7 +20,7 @@ ENV NODE_ENV=production \
 VOLUME /data
 EXPOSE 8787
 
-HEALTHCHECK --interval=20s --timeout=5s --start-period=120s --retries=5 \
-  CMD wget --quiet --tries=1 --spider http://localhost:8787/healthz || exit 1
+HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=3 \
+  CMD curl -fsS http://localhost:8787/healthz || exit 1
 
 CMD ["node", "src/index.js"]
