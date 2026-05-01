@@ -76,7 +76,7 @@ function volumeToMeta(v, source = 'gb') {
 
 export async function searchCatalog({ id, search, skip = 0 }) {
   if (id === 'popular') {
-    const cacheKey = 'popular-volumes';
+    const cacheKey = 'popular-volumes:v2';
     const cached = await cache.get(cacheKey);
     if (cached) return cached;
 
@@ -97,7 +97,7 @@ export async function searchCatalog({ id, search, skip = 0 }) {
         const top = ranked[0]?.h;
         if (top) {
           // pre-cache for later /meta lookups
-          await cache.set(`volume:${top.id.startsWith('OL') ? 'ol' : 'gb'}:${top.id}`, top, 7 * 24 * 3600);
+          await cache.set(`volume:v2:${top.id.startsWith('OL') ? 'ol' : 'gb'}:${top.id}`, top, 7 * 24 * 3600);
           results.push(volumeToMeta(top, source));
         }
       } catch (e) {
@@ -110,7 +110,7 @@ export async function searchCatalog({ id, search, skip = 0 }) {
 
   if (id === 'search' && search?.trim()) {
     const q = search.trim();
-    const cacheKey = `search-meta:${q.toLowerCase()}:${skip}`;
+    const cacheKey = `search-meta:v2:${q.toLowerCase()}:${skip}`;
     const cached = await cache.get(cacheKey);
     if (cached) return cached;
 
@@ -120,7 +120,7 @@ export async function searchCatalog({ id, search, skip = 0 }) {
     // re-fetching the upstream provider (which may be 429-rate-limited).
     await Promise.all(
       hits.map((v) =>
-        cache.set(`volume:${v.id.startsWith('OL') ? 'ol' : 'gb'}:${v.id}`, v, 7 * 24 * 3600)
+        cache.set(`volume:v2:${v.id.startsWith('OL') ? 'ol' : 'gb'}:${v.id}`, v, 7 * 24 * 3600)
       )
     );
     await cache.set(cacheKey, metas, 24 * 3600);
@@ -136,7 +136,7 @@ export async function getMeta(id) {
   if (!m) return null;
   const [, prefix, volId] = m;
 
-  const cacheKey = `volume:${prefix}:${volId}`;
+  const cacheKey = `volume:v2:${prefix}:${volId}`;
   let volume = await cache.get(cacheKey);
   if (!volume) {
     try {
