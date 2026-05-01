@@ -14,26 +14,41 @@ import { cache } from './cache.js';
 
 /**
  * Try Google Books first (richer covers + descriptions); fall back to
- * OpenLibrary on 429 / network errors.
+ * OpenLibrary on any error (429, network, empty result).
  */
 async function searchBooks(query, opts) {
+  // strategy 1 — Google Books
   try {
     const r = await gbSearch(query, opts);
     if (r.length > 0) return { source: 'gb', volumes: r };
-    // empty results → also fall back
-    throw new Error('empty gb');
   } catch (e) {
+    console.warn('[search] gb failed:', e.message);
+  }
+  // strategy 2 — OpenLibrary
+  try {
     const r = await olSearch(query, opts);
     return { source: 'ol', volumes: r };
+  } catch (e) {
+    console.warn('[search] ol failed:', e.message);
+    return { source: 'none', volumes: [] };
   }
 }
 
 async function getVolume(id) {
-  // gb-* IDs come from Google; ol-* from OpenLibrary
-  if (id.startsWith('OL')) return await olGetWork(`/works/${id.replace(/^OL/, '')}`);
+  // OpenLibrary id ("OL...W") — fetch from OL
+  if (id.startsWith('OL')) {
+    try {
+      return await olGetWork(`/works/${id.replace(/^OL/, '')}`);
+    } catch (e) {
+      console.warn('[meta] ol failed:', e.message);
+      return null;
+    }
+  }
+  // Google Books id — try GB first, fall back to OL by ISBN search if available
   try {
     return await gbGetVolume(id);
-  } catch {
+  } catch (e) {
+    console.warn('[meta] gb failed:', e.message);
     return null;
   }
 }
