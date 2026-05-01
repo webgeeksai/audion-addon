@@ -94,7 +94,12 @@ export async function searchCatalog({ id, search, skip = 0 }) {
             return { h, score };
           })
           .sort((a, b) => b.score - a.score);
-        if (ranked[0]?.h) results.push(volumeToMeta(ranked[0].h, source));
+        const top = ranked[0]?.h;
+        if (top) {
+          // pre-cache for later /meta lookups
+          await cache.set(`volume:${top.id.startsWith('OL') ? 'ol' : 'gb'}:${top.id}`, top, 7 * 24 * 3600);
+          results.push(volumeToMeta(top, source));
+        }
       } catch (e) {
         console.warn('popular query failed:', q, e.message);
       }
@@ -111,6 +116,13 @@ export async function searchCatalog({ id, search, skip = 0 }) {
 
     const { volumes: hits, source } = await searchBooks(q, { skip, limit: 20 });
     const metas = hits.map((v) => volumeToMeta(v, source)).filter(Boolean);
+    // Pre-cache each volume so /meta/audiobook/{id} can serve without
+    // re-fetching the upstream provider (which may be 429-rate-limited).
+    await Promise.all(
+      hits.map((v) =>
+        cache.set(`volume:${v.id.startsWith('OL') ? 'ol' : 'gb'}:${v.id}`, v, 7 * 24 * 3600)
+      )
+    );
     await cache.set(cacheKey, metas, 24 * 3600);
     return metas;
   }
