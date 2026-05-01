@@ -1,0 +1,34 @@
+services:
+  audion-addon:
+    image: 'audion-addon:latest'
+    build: .
+    environment:
+      - NODE_ENV=production
+      - PORT=8787
+      - CACHE_DB=/data/cache.db
+      # use Flaresolverr already deployed on the home server when ABB Cloudflare-blocks
+      - FLARESOLVERR=${FLARESOLVERR:-http://flaresolverr:8191}
+      - ABB_BASE=${ABB_BASE:-https://audiobookbay.lu}
+    volumes:
+      - 'audion-addon-data:/data'
+    expose:
+      - 8787
+    networks:
+      - default
+      - coolify
+    restart: unless-stopped
+    labels:
+      - traefik.enable=true
+      - traefik.docker.network=coolify
+      - traefik.http.routers.audion-addon.rule=Host(`audion.webgeeksai.in`)
+      - traefik.http.routers.audion-addon.entryPoints=https
+      - traefik.http.routers.audion-addon.tls=true
+      - traefik.http.routers.audion-addon.tls.certresolver=letsencrypt
+      - traefik.http.services.audion-addon.loadbalancer.server.port=8787
+
+volumes:
+  audion-addon-data:
+
+networks:
+  coolify:
+    external: true
