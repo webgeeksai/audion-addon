@@ -19,6 +19,7 @@ import { cors } from 'hono/cors';
 import { manifest } from './manifest.js';
 import { searchCatalog, getMeta } from './catalog.js';
 import { resolveStreams } from './streams.js';
+import { saveTracksToLibrary } from './library.js';
 
 const app = new Hono();
 
@@ -93,6 +94,39 @@ app.get('/stream/audiobook/*', async (c) => {
   } catch (e) {
     console.error('stream error:', e);
     return c.json({ streams: [], error: String(e?.message ?? e) }, 500);
+  }
+});
+
+/**
+ * Save-to-library — resolve RD stream + download every track to /library
+ * (the Audiobookshelf watched folder) so the book becomes a permanent library
+ * entry with offline + progress sync.
+ */
+app.post('/save/:id', async (c) => {
+  const id = decodeURIComponent(c.req.param('id'));
+  const rdToken = c.req.query('rd_token') ?? c.req.header('X-RD-Token') ?? null;
+  if (!rdToken) {
+    return c.json({ error: 'rd_token required' }, 400);
+  }
+  try {
+    const meta = await getMeta(id);
+    if (!meta) return c.json({ error: 'unknown book' }, 404);
+
+    const streams = await resolveStreams({ id, rdToken });
+    const stream = streams.find((s) => s.audion?.tracks?.length);
+    if (!stream) {
+      return c.json({ error: 'no resolvable streams to save' }, 422);
+    }
+    const author = (meta.audion?.authors ?? meta.director ?? ['Unknown'])[0];
+    const result = await saveTracksToLibrary({
+      author,
+      bookTitle: meta.name,
+      tracks: stream.audion.tracks,
+    });
+    return c.json({ ok: true, ...result, meta: { name: meta.name, author } });
+  } catch (e) {
+    console.error('save error:', e);
+    return c.json({ error: String(e?.message ?? e) }, 500);
   }
 });
 
