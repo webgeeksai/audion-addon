@@ -17,7 +17,7 @@ ENV NODE_ENV=production \
 VOLUME /data
 EXPOSE 8787
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+HEALTHCHECK --interval=20s --timeout=5s --start-period=120s --retries=5 \
   CMD wget --quiet --tries=1 --spider http://localhost:8787/healthz || exit 1
 
 CMD ["node", "src/index.js"]
