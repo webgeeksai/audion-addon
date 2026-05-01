@@ -7,9 +7,36 @@
  * Optional enrichment: Audnexus chapters/narrator when an ASIN can be inferred.
  */
 
-import { searchBooks, getVolume } from './googleBooks.js';
+import { searchBooks as gbSearch, getVolume as gbGetVolume } from './googleBooks.js';
+import { searchBooks as olSearch, getWork as olGetWork } from './openLibrary.js';
 import { getChapters, getBook as audnexusBook } from './audnexus.js';
 import { cache } from './cache.js';
+
+/**
+ * Try Google Books first (richer covers + descriptions); fall back to
+ * OpenLibrary on 429 / network errors.
+ */
+async function searchBooks(query, opts) {
+  try {
+    const r = await gbSearch(query, opts);
+    if (r.length > 0) return { source: 'gb', volumes: r };
+    // empty results → also fall back
+    throw new Error('empty gb');
+  } catch (e) {
+    const r = await olSearch(query, opts);
+    return { source: 'ol', volumes: r };
+  }
+}
+
+async function getVolume(id) {
+  // gb-* IDs come from Google; ol-* from OpenLibrary
+  if (id.startsWith('OL')) return await olGetWork(`/works/${id.replace(/^OL/, '')}`);
+  try {
+    return await gbGetVolume(id);
+  } catch {
+    return null;
+  }
+}
 
 const POPULAR_QUERIES = [
   'project hail mary andy weir',
@@ -22,10 +49,11 @@ const POPULAR_QUERIES = [
   'fourth wing rebecca yarros',
 ];
 
-function volumeToMeta(v) {
+function volumeToMeta(v, source = 'gb') {
   if (!v?.id) return null;
+  const idPrefix = v.id.startsWith('OL') ? 'ol' : source;
   return {
-    id: `audion:gb-${v.id}`,
+    id: `audion:${idPrefix}-${v.id}`,
     type: 'audiobook',
     name: v.subtitle ? `${v.title}: ${v.subtitle}` : v.title,
     poster: v.cover,
@@ -37,11 +65,11 @@ function volumeToMeta(v) {
     cast: [],
     genres: v.categories,
     audion: {
-      googleBooksId: v.id,
+      [idPrefix === 'ol' ? 'openLibraryId' : 'googleBooksId']: v.id,
       authors: v.authors,
       publisher: v.publisher,
-      isbn: v.industryIdentifiers?.find((x) => x.type === 'ISBN_13')?.identifier,
-      rating: v.averageRating,
+      isbn: v.industryIdentifiers?.find((x) => x.type === 'ISBN_13' || x.type === 'ISBN')?.identifier,
+      rating: v.averageRating ?? v.rating,
     },
   };
 }
@@ -55,23 +83,21 @@ export async function searchCatalog({ id, search, skip = 0 }) {
     const results = [];
     for (const q of POPULAR_QUERIES) {
       try {
-        const hits = await searchBooks(q, { limit: 5, langRestrict: 'en' });
-        // pick the best English hit:
-        // - require language === 'en'
-        // - prefer original title without parenthetical hints (Tamil), (Hindi)
-        // - bias by author match
+        const { volumes: hits, source } = await searchBooks(q, { limit: 5, langRestrict: 'en' });
         const refTokens = q.toLowerCase().split(/\s+/).filter((w) => w.length > 2);
         const ranked = hits
           .map((h) => {
             const text = `${h.title} ${(h.authors ?? []).join(' ')}`.toLowerCase();
             let score = refTokens.filter((t) => text.includes(t)).length;
             if (h.language && h.language !== 'en') score -= 5;
-            if (/\([^)]*\)/.test(h.title ?? '')) score -= 1; // demote (Tamil) etc
+            if (/\([^)]*\)/.test(h.title ?? '')) score -= 1;
             return { h, score };
           })
           .sort((a, b) => b.score - a.score);
-        if (ranked[0]?.h) results.push(volumeToMeta(ranked[0].h));
-      } catch {}
+        if (ranked[0]?.h) results.push(volumeToMeta(ranked[0].h, source));
+      } catch (e) {
+        console.warn('popular query failed:', q, e.message);
+      }
     }
     await cache.set(cacheKey, results, 6 * 3600);
     return results;
@@ -83,8 +109,8 @@ export async function searchCatalog({ id, search, skip = 0 }) {
     const cached = await cache.get(cacheKey);
     if (cached) return cached;
 
-    const hits = await searchBooks(q, { skip, limit: 20 });
-    const metas = hits.map(volumeToMeta).filter(Boolean);
+    const { volumes: hits, source } = await searchBooks(q, { skip, limit: 20 });
+    const metas = hits.map((v) => volumeToMeta(v, source)).filter(Boolean);
     await cache.set(cacheKey, metas, 24 * 3600);
     return metas;
   }
@@ -93,11 +119,12 @@ export async function searchCatalog({ id, search, skip = 0 }) {
 }
 
 export async function getMeta(id) {
-  const m = id.match(/^audion:gb-(.+)$/);
+  // Match audion:gb-XXX or audion:ol-OLXXXW
+  const m = id.match(/^audion:(gb|ol)-(.+)$/);
   if (!m) return null;
-  const volId = m[1];
+  const [, prefix, volId] = m;
 
-  const cacheKey = `volume:${volId}`;
+  const cacheKey = `volume:${prefix}:${volId}`;
   let volume = await cache.get(cacheKey);
   if (!volume) {
     try {
@@ -107,7 +134,7 @@ export async function getMeta(id) {
       return null;
     }
   }
-  const meta = volumeToMeta(volume);
+  const meta = volumeToMeta(volume, prefix);
   if (!meta) return null;
 
   // Try to enrich with Audnexus chapters via Audible search (best-effort)
