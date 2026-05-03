@@ -103,7 +103,7 @@ async function findInExistingRD(rdToken, meta) {
 
   const out = [];
   for (const t of candidates) {
-    const cached = await rdCache.get(`${rdToken.slice(-8)}:${t.id}`);
+    const cached = await rdCache.get(`v2:${rdToken.slice(-8)}:${t.id}`);
     if (cached) {
       out.push(streamFromTracks(cached, t.filename, true));
       continue;
@@ -112,7 +112,7 @@ async function findInExistingRD(rdToken, meta) {
       const info = await torrentInfo(rdToken, t.id);
       const tracks = await tracksFromTorrent(rdToken, info);
       if (!tracks.length) continue;
-      await rdCache.set(`${rdToken.slice(-8)}:${t.id}`, tracks, 7 * 24 * 3600);
+      await rdCache.set(`v2:${rdToken.slice(-8)}:${t.id}`, tracks, 7 * 24 * 3600);
       out.push(streamFromTracks(tracks, t.filename, true));
     } catch (e) {
       console.warn('torrent info/unrestrict failed for', t.id, e.message);
@@ -131,7 +131,7 @@ async function scrapeAndAdd(rdToken, meta) {
   const out = [];
   for (const r of releases.slice(0, 3)) {
     // already-resolved hash?
-    const cached = await rdCache.get(`hash:${r.infohash}`);
+    const cached = await rdCache.get(`v2:hash:${r.infohash}`);
     if (cached) {
       out.push(streamFromTracks(cached.tracks, cached.filename ?? r.title, true));
       continue;
@@ -143,7 +143,7 @@ async function scrapeAndAdd(rdToken, meta) {
       const tracks = await tracksFromTorrent(rdToken, info);
       if (tracks.length) {
         await rdCache.set(
-          `hash:${r.infohash}`,
+          `v2:hash:${r.infohash}`,
           { tracks, filename: info.filename },
           7 * 24 * 3600
         );
