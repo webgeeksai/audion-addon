@@ -1,28 +1,31 @@
 /**
- * Audiobook torrent scrapers.
- * Returns { magnet, infohash, title, size, seeders } objects.
+ * Audiobook torrent discovery via Prowlarr.
  *
- * Sources:
- *   - AudioBookBay (.lu mirror) — best public audiobook tracker
- *   - 1337x — generic fallback
+ * Prowlarr aggregates ~70 trackers (1337x, ThePirateBay, Internet Archive,
+ * Nyaa, MyAnonamouse, AudioBookBay etc.) behind a single Newznab-style API
+ * with built-in Cloudflare bypass via Flaresolverr. We delegate all the
+ * scraping/anti-bot stuff to it instead of poking ABB ourselves (which has
+ * been domain-rotating and is unreliable from typical egress points).
  *
- * Phase 3: minimal HTML scrape (no Cloudflare bypass yet — we'll plug in
- * Flaresolverr at deploy time if the host fronts ABB through CF).
+ * Config (env):
+ *   PROWLARR_URL       e.g. https://prowlarr.webgeeksai.in
+ *   PROWLARR_API_KEY   from Prowlarr Settings → General → API Key
+ *
+ * Exports the same shape callers (streams.js) expect:
+ *   { magnet, infohash, title, size, seeders, _score }[]
  */
 
 import axios from 'axios';
 
-const UA =
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15';
+const PROWLARR_URL = (process.env.PROWLARR_URL ?? '').replace(/\/$/, '');
+const PROWLARR_API_KEY = process.env.PROWLARR_API_KEY ?? '';
 
-const ABB_BASE = process.env.ABB_BASE ?? 'https://audiobookbay.lu';
+// Newznab category 3030 = Audio/Audiobook
+const AUDIOBOOK_CATEGORY = 3030;
 
 const http = axios.create({
-  timeout: 25_000,
-  headers: {
-    'User-Agent': UA,
-    'Accept-Language': 'en-US,en;q=0.9',
-  },
+  timeout: 30_000,
+  headers: { 'X-Api-Key': PROWLARR_API_KEY },
 });
 
 async function withRetry(fn, attempts = 2) {
@@ -37,22 +40,30 @@ async function withRetry(fn, attempts = 2) {
   throw last;
 }
 
-/** Try every source, dedupe + rank by relevance to the meta */
+/** Top-level: query Prowlarr → magnets, ranked by relevance. */
 export async function findReleases(meta) {
-  const queries = buildQueries(meta);
-  const all = [];
-  for (const q of queries) {
-    try {
-      const hits = await abbSearch(q);
-      all.push(...hits);
-      if (all.length >= 8) break;
-    } catch (e) {
-      console.warn('abb query failed:', q, e.message);
-    }
+  if (!PROWLARR_URL || !PROWLARR_API_KEY) {
+    console.warn('[scrape] PROWLARR_URL/PROWLARR_API_KEY not set — no results');
+    return [];
   }
-  // dedupe by infohash
-  const seen = new Map();
-  for (const r of all) if (!seen.has(r.infohash)) seen.set(r.infohash, r);
+
+  const queries = buildQueries(meta);
+  const seen = new Map(); // dedupe by infohash
+
+  for (const q of queries) {
+    let hits = [];
+    try {
+      hits = await withRetry(() => prowlarrSearch(q));
+    } catch (e) {
+      console.warn('[scrape] prowlarr query failed:', q, e.message);
+      continue;
+    }
+    for (const h of hits) {
+      const release = await prowlarrToRelease(h);
+      if (release && !seen.has(release.infohash)) seen.set(release.infohash, release);
+    }
+    if (seen.size >= 8) break;
+  }
 
   const refTokens = tokensFromMeta(meta);
   if (process.env.DEBUG) {
@@ -65,8 +76,83 @@ export async function findReleases(meta) {
   return [...seen.values()]
     .map((r) => ({ ...r, _score: scoreRelevance(r.title, refTokens) }))
     .filter((r) => r._score >= 0.3)
-    .sort((a, b) => b._score - a._score);
+    .sort((a, b) => {
+      // Sort by score, then prefer higher seeders, then larger size (longer audiobook).
+      if (b._score !== a._score) return b._score - a._score;
+      if ((b.seeders ?? 0) !== (a.seeders ?? 0)) return (b.seeders ?? 0) - (a.seeders ?? 0);
+      return (b.size ?? 0) - (a.size ?? 0);
+    });
 }
+
+async function prowlarrSearch(query) {
+  const url = `${PROWLARR_URL}/api/v1/search`;
+  const { data } = await http.get(url, {
+    params: {
+      query,
+      categories: AUDIOBOOK_CATEGORY,
+      type: 'search',
+      limit: 50,
+    },
+  });
+  if (!Array.isArray(data)) return [];
+  // Filter to torrent protocol only (skip Usenet/NZBs — RD only takes magnets/torrents)
+  return data.filter((r) => r.protocol === 'torrent');
+}
+
+/** Convert a Prowlarr search hit into a {magnet, infohash, ...} release. */
+async function prowlarrToRelease(hit) {
+  // Path 1 — guid is itself a magnet (TPB, some others). Cheapest.
+  let magnet = null;
+  if (typeof hit.guid === 'string' && hit.guid.startsWith('magnet:?')) {
+    magnet = hit.guid;
+  } else if (typeof hit.magnetUrl === 'string' && hit.magnetUrl.startsWith('magnet:?')) {
+    magnet = hit.magnetUrl;
+  } else if (typeof hit.magnetUrl === 'string' && hit.magnetUrl.startsWith('http')) {
+    // Path 2 — Prowlarr-proxied magnetUrl that 302s to a magnet:?
+    magnet = await followMagnetRedirect(hit.magnetUrl);
+  }
+  // Path 3 — only downloadUrl (returns .torrent file). Skip for now; could
+  // be added by parsing bencode infohash and synthesizing a magnet.
+  if (!magnet) return null;
+
+  const infohash = extractInfohash(magnet);
+  if (!infohash) return null;
+
+  return {
+    magnet,
+    infohash,
+    title: hit.title,
+    size: hit.size,
+    seeders: hit.seeders,
+    indexer: hit.indexer,
+  };
+}
+
+async function followMagnetRedirect(url) {
+  // We expect a 30x with Location: magnet:... — DON'T follow into HTTP redirects.
+  try {
+    const res = await axios.get(url, {
+      maxRedirects: 0,
+      timeout: 15_000,
+      validateStatus: (s) => s >= 200 && s < 400,
+    });
+    const loc = res.headers?.location;
+    if (loc && loc.startsWith('magnet:?')) return loc;
+  } catch (e) {
+    // axios throws on 30x when maxRedirects=0; capture Location from the err
+    const loc = e?.response?.headers?.location;
+    if (loc && loc.startsWith('magnet:?')) return loc;
+  }
+  return null;
+}
+
+function extractInfohash(magnet) {
+  const m = magnet.match(/xt=urn:btih:([A-Fa-f0-9]{40}|[A-Za-z2-7]{32})/);
+  if (!m) return null;
+  return m[1].toLowerCase();
+}
+
+// ─── shared helpers (kept from the original ABB scraper) ─────────────────
 
 function tokensFromMeta(meta) {
   const cleanTitle = cleanForQuery(meta.name);
@@ -92,11 +178,9 @@ function scoreRelevance(text, refTokens) {
   return refTokens.size > 0 ? hits / refTokens.size : 0;
 }
 
-/** Substring match allowing up to 1 character difference (handles ABB obfuscation). */
 function fuzzyContains(haystack, needle) {
   if (needle.length < 4) return haystack.includes(needle);
   if (haystack.includes(needle)) return true;
-  // sliding window with edit distance ≤ 1 against the needle length
   const len = needle.length;
   for (let i = 0; i <= haystack.length - len; i++) {
     const win = haystack.slice(i, i + len);
@@ -115,10 +199,9 @@ function editDistance(a, b) {
   return diff;
 }
 
-/** Strip noise: parens, language hints, "audiobook" filler */
 function cleanForQuery(name = '') {
   return name
-    .replace(/\([^)]*\)/g, '') // (Tamil), (Movie Tie-In)
+    .replace(/\([^)]*\)/g, '')
     .replace(/\b(unabridged|audiobook|edition|hindi|tamil|spanish|french|german)\b/gi, '')
     .replace(/[^\p{L}\p{N}\s]/gu, ' ')
     .replace(/\s+/g, ' ')
@@ -132,80 +215,4 @@ function buildQueries(meta) {
   if (title && author) queries.add(`${title} ${author}`);
   if (title) queries.add(title);
   return [...queries];
-}
-
-/** Search AudioBookBay → list of release detail page URLs */
-async function abbSearch(query) {
-  const url = `${ABB_BASE}/?s=${encodeURIComponent(query)}`;
-  const { data } = await withRetry(() => http.get(url));
-  const html = String(data);
-
-  // Verify this is a search result page (not the front page after a timeout/error).
-  // ABB shows "Search results for ..." in the page when there's a query.
-  const isSearchPage =
-    /Search Results?/i.test(html) || /class="searchPage/.test(html);
-  if (!isSearchPage && process.env.DEBUG) {
-    console.log('[scrape] WARN: not a search results page for', query);
-  }
-
-  const detailLinks = [
-    ...new Set(
-      [...html.matchAll(/href="(https?:\/\/[^"]*audiobookbay[^"]*\/abss\/[^"]+)"/g)].map(
-        (m) => m[1]
-      )
-    ),
-  ].slice(0, 4);
-
-  const results = await Promise.all(
-    detailLinks.map((link) =>
-      withRetry(() => abbDetail(link)).catch(() => null)
-    )
-  );
-  return results.filter(Boolean);
-}
-
-async function abbDetail(detailUrl) {
-  const { data } = await http.get(detailUrl);
-  const html = String(data);
-
-  // Title: <h1 itemprop="name">…</h1>  (was `<h1 class="postTitle">` in older versions)
-  const titleMatch =
-    html.match(/<h1[^>]*itemprop="name"[^>]*>([\s\S]*?)<\/h1>/i) ||
-    html.match(/<h1[^>]*class="[^"]*postTitle[^"]*"[^>]*>([\s\S]*?)<\/h1>/i);
-  const title = titleMatch
-    ? titleMatch[1].replace(/<[^>]+>/g, '').trim()
-    : detailUrl.split('/').filter(Boolean).pop();
-
-  // Infohash: ABB v3+ puts it in <td>Info Hash:</td><td>...</td>
-  const hashMatch =
-    html.match(/<td>Info Hash:?<\/td>\s*<td[^>]*>([a-fA-F0-9]{40})<\/td>/i) ||
-    html.match(/[Hh]ash[^a-fA-F0-9]{0,20}([a-fA-F0-9]{40})/);
-  if (!hashMatch) return null;
-  const infohash = hashMatch[1].toLowerCase();
-
-  // Format hint (e.g. "MP3 64kbps", "M4B 96kbps") — used to label streams
-  const formatMatch = html.match(/Format:?\s*<\/?[a-z]*>?\s*([A-Za-z0-9 ]+)/i);
-  const sizeMatch = html.match(/(\d+(?:\.\d+)?\s*(?:GB|MB))/i);
-
-  // Trackers — ABB shows a few static UDPs by default; we just attach common ones
-  const trackers = [
-    'udp://tracker.opentrackr.org:1337/announce',
-    'udp://tracker.openbittorrent.com:6969/announce',
-    'udp://exodus.desync.com:6969/announce',
-    'udp://tracker.torrent.eu.org:451/announce',
-    'udp://open.stealth.si:80/announce',
-  ];
-  const trMagnet = trackers.map((t) => `&tr=${encodeURIComponent(t)}`).join('');
-  const magnet = `magnet:?xt=urn:btih:${infohash}&dn=${encodeURIComponent(
-    title
-  )}${trMagnet}`;
-
-  return {
-    magnet,
-    infohash,
-    title,
-    format: formatMatch?.[1]?.trim(),
-    size: sizeMatch?.[1],
-    seeders: undefined,
-  };
 }
