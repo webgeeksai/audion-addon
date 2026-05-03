@@ -89,8 +89,22 @@ export async function tracksFromTorrent(token, info) {
     .filter((f) => f.selected && AUDIO_EXT.test(f.path))
     .sort((a, b) => a.path.localeCompare(b.path, undefined, { numeric: true }));
 
+  // RD sometimes returns a SINGLE link for a multi-file torrent — it has
+  // bundled the whole torrent into one .rar/.zip CDN download. We can't
+  // stream individual chapters from that, and giving the .rar URL to
+  // expo-audio results in "no sound for a few seconds, then crash".
+  // Skip these so the caller can fall through to a different release.
+  const selectedCount = info.files.filter((f) => f.selected).length;
+  if ((info.links?.length ?? 0) < selectedCount && audioFiles.length > 1) {
+    console.warn(
+      '[rd] torrent', info.id, 'archived by RD into',
+      info.links?.length, 'link for', selectedCount, 'files — skipping'
+    );
+    return [];
+  }
+  if (audioFiles.length === 0) return [];
+
   // info.links is per *selected* file (positional), in selection order.
-  // Build the same order using position in info.files where selected===1.
   const selectedOrder = info.files
     .filter((f) => f.selected)
     .sort((a, b) => a.id - b.id);
@@ -106,6 +120,12 @@ export async function tracksFromTorrent(token, info) {
       try {
         const u = await unrestrict(token, link);
         if (!u.download) return null;
+        // Defensive: reject any non-audio URL even if AUDIO_EXT matched the
+        // source path (RD-archive leak). expo-audio can't decode .rar.
+        if (!AUDIO_EXT.test(u.download.split('?')[0])) {
+          console.warn('[rd] non-audio url returned for', f.path, '→', u.download.slice(0, 90));
+          return null;
+        }
         return {
           url: u.download,
           duration: undefined,
