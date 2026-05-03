@@ -201,8 +201,13 @@ function editDistance(a, b) {
 
 function cleanForQuery(name = '') {
   return name
+    // Drop everything after the first colon — usually a subtitle that
+    // doesn't appear in torrent names ("Sapiens: A Brief History..." → "Sapiens").
+    .split(':')[0]
+    // Strip parens AND brackets contents.
     .replace(/\([^)]*\)/g, '')
-    .replace(/\b(unabridged|audiobook|edition|hindi|tamil|spanish|french|german)\b/gi, '')
+    .replace(/\[[^\]]*\]/g, '')
+    .replace(/\b(unabridged|audiobook|edition|hindi|tamil|spanish|french|german|tenth|anniversary)\b/gi, '')
     .replace(/[^\p{L}\p{N}\s]/gu, ' ')
     .replace(/\s+/g, ' ')
     .trim();
@@ -210,9 +215,16 @@ function cleanForQuery(name = '') {
 
 function buildQueries(meta) {
   const title = cleanForQuery(meta.name ?? '');
-  const author = (meta.audion?.authors ?? meta.director ?? [])[0] ?? '';
+  const authors = meta.audion?.authors ?? meta.director ?? [];
+  const author = authors[0] ?? '';
+  // Author surname is usually a stronger filter than full name across torrents.
+  const surname = author.split(/\s+/).slice(-1)[0] ?? '';
+
   const queries = new Set();
-  if (title && author) queries.add(`${title} ${author}`);
+  // Strongest first: title + author surname (matches "The Martian Weir" etc.)
+  if (title && surname) queries.add(`${title} ${surname}`);
+  if (title && author && author !== surname) queries.add(`${title} ${author}`);
+  // Fallback: title only — broader but may need higher relevance threshold
   if (title) queries.add(title);
   return [...queries];
 }
