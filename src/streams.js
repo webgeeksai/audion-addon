@@ -64,22 +64,34 @@ export async function resolveStreams({ id, rdToken }) {
   return out;
 }
 
-// Match a torrent's filename loosely against book title + author.
+// Match a torrent's filename against book title + author. We need to be
+// strict here — torrents in the user's RD library for *other* books in the
+// same series share most prefix words ("Harry Potter and the …") so a loose
+// match returned book 6 for a book 1 query.
+const FILLER = new Set(['and', 'the', 'for', 'with', 'from', 'into', 'a', 'an', 'of']);
 function matches(torrentName, meta) {
   const norm = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
-  const tokens = [
+  const titleTokens = norm(meta.name ?? '')
+    .split(' ')
+    .filter((w) => w.length > 2 && !FILLER.has(w));
+  // Last 2-3 title words are usually the distinctive ones (after subtitle).
+  const distinctive = new Set(titleTokens.slice(-3));
+  const allTokens = [
     ...(meta.audion?.authors ?? []),
-    meta.name,
+    ...titleTokens,
   ]
     .filter(Boolean)
     .map(norm)
     .flatMap((s) => s.split(' '))
-    .filter((w) => w.length > 2);
+    .filter((w) => w.length > 2 && !FILLER.has(w));
   const t = norm(torrentName);
-  // require at least 60% of meta tokens to appear
   let hits = 0;
-  for (const w of tokens) if (t.includes(w)) hits++;
-  return tokens.length > 0 && hits / tokens.length >= 0.55;
+  for (const w of allTokens) if (t.includes(w)) hits++;
+  let distinctiveHits = 0;
+  for (const w of distinctive) if (t.includes(w)) distinctiveHits++;
+  // Require ≥85% overall AND at least one distinctive word.
+  const ratio = allTokens.length > 0 ? hits / allTokens.length : 0;
+  return ratio >= 0.85 && (distinctive.size === 0 || distinctiveHits >= 1);
 }
 
 async function findInExistingRD(rdToken, meta) {

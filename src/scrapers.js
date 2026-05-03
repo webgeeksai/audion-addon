@@ -73,12 +73,40 @@ export async function findReleases(meta) {
       console.log('[scrape]', sc.toFixed(2), '|', r.title?.slice(0, 60));
     }
   }
+  // Identify "distinctive" tokens — book-specific words (not in author name).
+  // For HP: refTokens = {harry, potter, sorcerers, stone, rowling}
+  //         distinctive = {sorcerers, stone}     (drops the franchise prefix)
+  // We require ALL distinctive tokens to match so "Half-Blood Prince" releases
+  // can't pass for a "Sorcerer's Stone" query.
+  const authorTokens = new Set(
+    ((meta.audion?.authors ?? meta.director ?? [])[0] ?? '')
+      .toLowerCase()
+      .split(/\s+/)
+      .filter(Boolean)
+  );
+  const cleanedTitleTokens = cleanForQuery(meta.name ?? '')
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((w) => w.length > 2 && !STOPWORDS.has(w));
+  // Last word(s) of the title are usually the distinctive ones (subtitle was
+  // already stripped by cleanForQuery). Take the last 2-3 "real" words.
+  const distinctive = new Set(cleanedTitleTokens.slice(-3));
+
   return [...seen.values()]
-    .map((r) => ({ ...r, _score: scoreRelevance(r.title, refTokens) }))
-    .filter((r) => r._score >= 0.3)
+    .map((r) => ({
+      ...r,
+      _score: scoreRelevance(r.title, refTokens),
+      _distinctiveHits: countHits(r.title, distinctive),
+      _isEnglish: looksEnglish(r.title),
+    }))
+    .filter((r) => r._score >= 0.6)
+    // Require at least one distinctive (non-franchise) token to match.
+    .filter((r) => distinctive.size === 0 || r._distinctiveHits >= 1)
     .sort((a, b) => {
-      // Sort by score, then prefer higher seeders, then larger size (longer audiobook).
+      // Prefer English releases first, then score, then seeders, then size.
+      if (a._isEnglish !== b._isEnglish) return a._isEnglish ? -1 : 1;
       if (b._score !== a._score) return b._score - a._score;
+      if (b._distinctiveHits !== a._distinctiveHits) return b._distinctiveHits - a._distinctiveHits;
       if ((b.seeders ?? 0) !== (a.seeders ?? 0)) return (b.seeders ?? 0) - (a.seeders ?? 0);
       return (b.size ?? 0) - (a.size ?? 0);
     });
@@ -176,6 +204,33 @@ function scoreRelevance(text, refTokens) {
   let hits = 0;
   for (const w of refTokens) if (fuzzyContains(t, w)) hits++;
   return refTokens.size > 0 ? hits / refTokens.size : 0;
+}
+
+function countHits(text, tokens) {
+  if (!text) return 0;
+  const t = text.toLowerCase();
+  let hits = 0;
+  for (const w of tokens) if (fuzzyContains(t, w)) hits++;
+  return hits;
+}
+
+/**
+ * Detect non-English releases by hint words / non-ASCII title scripts. We
+ * don't reject them — just sort them last, so English audiobooks win when
+ * present.
+ */
+function looksEnglish(title) {
+  if (!title) return true;
+  // Non-ASCII (Greek, Cyrillic, Arabic, CJK, etc.) → not English
+  if (/[^\x00-\x7F]/.test(title)) return false;
+  const t = title.toLowerCase();
+  const foreignWords = [
+    'spanish', 'francais', 'français', 'francese', 'german', 'deutsch', 'italiano',
+    'portugues', 'português', 'norsk', 'svensk', 'tamil', 'hindi', 'arabic',
+    'chinese', 'japanese', 'korean', 'russian', 'polski', 'hebrew',
+    'lydbok', 'audiolibro', 'audiolibri', 'livre audio', 'hörbuch',
+  ];
+  return !foreignWords.some((w) => t.includes(w));
 }
 
 function fuzzyContains(haystack, needle) {
