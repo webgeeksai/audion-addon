@@ -99,8 +99,9 @@ export async function findReleases(meta) {
       _distinctiveHits: countHits(r.title, distinctive),
       _isEnglish: looksEnglish(r.title),
     }))
-    .filter((r) => r._score >= 0.6)
-    // Require at least one distinctive (non-franchise) token to match.
+    .filter((r) => r._score >= 0.5)
+    // Require at least one distinctive (non-franchise) token to match — that's
+    // what stops "Half-Blood Prince" from matching a "Sorcerer's Stone" query.
     .filter((r) => distinctive.size === 0 || r._distinctiveHits >= 1)
     .sort((a, b) => {
       // Prefer English releases first, then score, then seeders, then size.
@@ -198,11 +199,30 @@ const STOPWORDS = new Set([
   'the', 'and', 'with', 'for', 'audiobook', 'unabridged', 'novel', 'volume', 'book', 'edition',
 ]);
 
+// Title-word synonyms we treat as equivalent when scoring.
+// Sorcerer↔Philosopher = US/UK Harry Potter book 1 retitling.
+const SYNONYMS = [
+  ['sorcerer', 'philosopher'],
+  ['sorcerers', 'philosophers'],
+];
+
+function fuzzyOrSynonym(text, needle) {
+  if (fuzzyContains(text, needle)) return true;
+  for (const group of SYNONYMS) {
+    if (group.includes(needle)) {
+      for (const alt of group) {
+        if (alt !== needle && fuzzyContains(text, alt)) return true;
+      }
+    }
+  }
+  return false;
+}
+
 function scoreRelevance(text, refTokens) {
   if (!text) return 0;
   const t = text.toLowerCase();
   let hits = 0;
-  for (const w of refTokens) if (fuzzyContains(t, w)) hits++;
+  for (const w of refTokens) if (fuzzyOrSynonym(t, w)) hits++;
   return refTokens.size > 0 ? hits / refTokens.size : 0;
 }
 
@@ -210,7 +230,7 @@ function countHits(text, tokens) {
   if (!text) return 0;
   const t = text.toLowerCase();
   let hits = 0;
-  for (const w of tokens) if (fuzzyContains(t, w)) hits++;
+  for (const w of tokens) if (fuzzyOrSynonym(t, w)) hits++;
   return hits;
 }
 
@@ -275,11 +295,21 @@ function buildQueries(meta) {
   // Author surname is usually a stronger filter than full name across torrents.
   const surname = author.split(/\s+/).slice(-1)[0] ?? '';
 
+  // Pull SHORT lead title — first 2-3 meaningful words. Prowlarr does
+  // AND-search across query tokens, so longer queries (the full subtitle,
+  // alternate spellings like Sorcerer's vs Philosopher's, etc.) reject all
+  // releases. We hand it the smallest unambiguous query and let our own
+  // distinctive-token scoring pick the right release from the broader set.
+  const titleTokens = title.toLowerCase().split(/\s+/).filter((w) => w.length > 2);
+  const shortTitle = titleTokens.slice(0, 3).join(' ');
+  const veryShortTitle = titleTokens.slice(0, 2).join(' ');
+
   const queries = new Set();
-  // Strongest first: title + author surname (matches "The Martian Weir" etc.)
+  if (shortTitle && surname) queries.add(`${shortTitle} ${surname}`);
+  if (veryShortTitle && surname && veryShortTitle !== shortTitle) {
+    queries.add(`${veryShortTitle} ${surname}`);
+  }
   if (title && surname) queries.add(`${title} ${surname}`);
-  if (title && author && author !== surname) queries.add(`${title} ${author}`);
-  // Fallback: title only — broader but may need higher relevance threshold
   if (title) queries.add(title);
   return [...queries];
 }
